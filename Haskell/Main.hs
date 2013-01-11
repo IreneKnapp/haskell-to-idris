@@ -1,10 +1,13 @@
 module Main (main) where
 
-import qualified Control.Monad.Identity as MTL
-import qualified Control.Monad.Error as MTL
-import qualified Control.Monad.State.Strict as MTL
+import Data.Maybe
+
 import qualified Language.Haskell.Exts as HS
 import qualified System.Environment as IO
+
+import qualified Idris.Types as IDR
+
+import Conversion
 
 
 main :: IO ()
@@ -29,7 +32,7 @@ convertFile inputPath outputPath = do
       putStrLn $ "Parse error at line " ++ (show $ HS.srcLine location)
                  ++ ": " ++ headline
     HS.ParseOk (module', comments) -> do
-      case runConversion $ visitModule module' comments of
+      case runConversion $ convertModule module' comments of
         Left problems -> do
           mapM_ (\(maybeLocation, headline) -> do
                    let report = (maybe "" (\location ->
@@ -45,73 +48,58 @@ convertFile inputPath outputPath = do
           putStrLn $ "Converted."
 
 
-type Problem = (Maybe HS.SrcLoc, String)
-
-instance MTL.Error () where
-  noMsg = ()
-
-data Conversion a =
-  Conversion (MTL.ErrorT () (MTL.StateT ([Problem], [String]) MTL.Identity) a)
-
-instance Monad Conversion where
-  return a = Conversion $ return a
-  (Conversion a) >>= b = Conversion $ do
-    v <- a
-    case b v of
-      Conversion b -> b
-
-
-runConversion :: Conversion () -> Either [Problem] String
-runConversion (Conversion action) =
-  MTL.runIdentity $ do
-    flip MTL.evalStateT ([], []) $ do
-      eitherProblemsResult <- MTL.runErrorT action
-      case eitherProblemsResult of
-        Left () -> do
-          (problems, _) <- MTL.get
-          return $ Left problems
-        Right () -> do
-          (_, outputItems) <- MTL.get
-          return $ Right $ concat outputItems
-
-
-abort :: Conversion a
-abort = Conversion $ do
-  MTL.throwError ()
-
-
-problem :: Maybe HS.SrcLoc -> String -> Conversion ()
-problem maybeLocation headline = Conversion $ do
-  (problems, output) <- MTL.get
-  let problems' = problems ++ [(maybeLocation, headline)]
-  MTL.put (problems', output)
+class HasLocation node where
+  nodeLocation :: node -> Maybe HS.SrcLoc
+instance HasLocation HS.Decl where
+  nodeLocation (HS.TypeDecl location _ _ _) = Just location
+  nodeLocation (HS.TypeFamDecl location _ _ _) = Just location
+  nodeLocation (HS.DataDecl location _ _ _ _ _ _) = Just location
+  nodeLocation (HS.GDataDecl location _ _ _ _ _ _ _) = Just location
+  nodeLocation (HS.DataFamDecl location _ _ _ _) = Just location
+  nodeLocation (HS.TypeInsDecl location _ _) = Just location
+  nodeLocation (HS.DataInsDecl location _ _ _ _) = Just location
+  nodeLocation (HS.GDataInsDecl location _ _ _ _ _) = Just location
+  nodeLocation (HS.ClassDecl location _ _ _ _ _) = Just location
+  nodeLocation (HS.InstDecl location _ _ _ _) = Just location
+  nodeLocation (HS.DerivDecl location _ _ _) = Just location
+  nodeLocation (HS.InfixDecl location _ _ _) = Just location
+  nodeLocation (HS.DefaultDecl location _) = Just location
+  nodeLocation (HS.SpliceDecl location _) = Just location
+  nodeLocation (HS.TypeSig location _ _) = Just location
+  nodeLocation (HS.FunBind matches) =
+    listToMaybe $ catMaybes $ map nodeLocation matches
+  nodeLocation (HS.PatBind location _ _ _ _) = Just location
+  nodeLocation (HS.ForImp location _ _ _ _ _) = Just location
+  nodeLocation (HS.ForExp location _ _ _ _) = Just location
+  nodeLocation (HS.RulePragmaDecl location _) = Just location
+  nodeLocation (HS.DeprPragmaDecl location _) = Just location
+  nodeLocation (HS.WarnPragmaDecl location _) = Just location
+  nodeLocation (HS.InlineSig location _ _ _) = Just location
+  nodeLocation (HS.InlineConlikeSig location _ _) = Just location
+  nodeLocation (HS.SpecSig location qname _) = Just location
+  nodeLocation (HS.SpecInlineSig location _ _ _ _) = Just location
+  nodeLocation (HS.InstSig location _ _ _) = Just location
+  nodeLocation (HS.AnnPragma location _) = Just location
+instance HasLocation HS.Match where
+  nodeLocation (HS.Match location _ _ _ _ _) = Just location
 
 
-emit :: String -> Conversion ()
-emit string = Conversion $ do
-  (problems, output) <- MTL.get
-  let output' = output ++ [string]
-  MTL.put (problems, output')
+convertModule :: HS.Module -> [HS.Comment] -> Conversion ()
+convertModule module' comments = do
+  idrisModule <- visitModule module' comments
+  IDR.emitNode idrisModule
 
 
-visitModule :: HS.Module -> [HS.Comment] -> Conversion ()
-visitModule
-    (HS.Module location name _ _ exports imports declarations) comments = do
-  HS.ModuleName name <- return name
-  emit $ "Module " ++ name ++ "\n"
-  emit "\n"
-  mapM_ visitDeclaration declarations
+visitName :: HS.Name -> Conversion IDR.Name
+visitName (HS.Ident name) = return $ IDR.Name name
+visitName (HS.Symbol name) = return $ IDR.Name name
 
 
-emitName :: HS.Name -> Conversion ()
-emitName (HS.Ident name) = emit name
-emitName (HS.Symbol name) = emit name
+visitModuleName :: HS.ModuleName -> Conversion IDR.Name
+visitModuleName (HS.ModuleName name) = return $ IDR.Name name
 
 
-emitModuleName :: HS.ModuleName -> Conversion ()
-emitModuleName (HS.ModuleName name) = emit name
-
-
+{-
 emitQName :: HS.QName -> Conversion ()
 emitQName (HS.Qual moduleName name) = do
   emitModuleName moduleName
@@ -127,138 +115,73 @@ emitQName (HS.Special (HS.TupleCon _ n)) = do
   emit ")"
 emitQName (HS.Special HS.Cons) = emit "::"
 emitQName (HS.Special HS.UnboxedSingleCon) = emit "()"
+-}
 
 
-visitDeclaration :: HS.Decl -> Conversion ()
+visitModule :: HS.Module -> [HS.Comment] -> Conversion IDR.Module
+visitModule
+    (HS.Module location name _ _ exports imports declarations) comments = do
+  idrisName <- visitModuleName name
+  idrisDeclarations <- mapM visitTopDeclaration declarations
+                       >>= return . concat
+  return IDR.Module {
+             IDR.moduleName = idrisName,
+             IDR.moduleDeclarations = idrisDeclarations
+           }
 
-visitDeclaration
-    (HS.TypeDecl location name _ _) = do
-  emitName name
-  emit " : Type\n"
-  emit "\n"
 
-visitDeclaration
-    (HS.TypeFamDecl location name _ _) = do
-  emitName name
-  emit " ... : Type\n"
-  emit "\n"
+visitTopDeclaration :: HS.Decl -> Conversion [IDR.TopDeclaration]
 
-visitDeclaration
-    (HS.DataDecl location _ _ name _ _ _) = do
-  emit "data "
-  emitName name
-  emit "\n"
-  emit "  = ...\n"
-  emit "\n"
+visitTopDeclaration
+    (HS.ClassDecl location _ name bindings _ declarations) = do
+  idrisName <- visitName name
+  idrisBindings <- mapM visitTypeVariableBinding bindings
+  let idrisClass = IDR.ClassTopDeclaration {
+                       IDR.classTopDeclarationName = idrisName,
+                       IDR.classTopDeclarationTypeVariableBindings =
+                         idrisBindings
+                     }
+  return [idrisClass]
 
-visitDeclaration
-    (HS.GDataDecl location _ _ name _ _ _ _) = do
-  emit "data "
-  emitName name
-  emit "\n"
-  emit "  = ... : Type\n"
-  emit "\n"
+visitTopDeclaration declaration = do
+  problem (nodeLocation declaration) "Unimplemented."
+  return []
 
-visitDeclaration
-    (HS.DataFamDecl location _ name _ _) = do
-  emit "data "
-  emitName name
-  emit "\n"
-  emit "  = ... : ... -> Type\n"
-  emit "\n"
 
-visitDeclaration
-    (HS.TypeInsDecl location _ _) = do
-  return ()
+visitTypeVariableBinding :: HS.TyVarBind -> Conversion IDR.TypeVariableBinding
+visitTypeVariableBinding (HS.KindedVar name kind) = do
+  idrisName <- visitName name
+  idrisKind <- visitKindSignature kind
+  return IDR.TypeVariableBinding {
+             IDR.typeVariableBindingName = idrisName,
+             IDR.typeVariableBindingSignature = Just idrisKind
+           }
+visitTypeVariableBinding (HS.UnkindedVar name) = do
+  idrisName <- visitName name
+  return IDR.TypeVariableBinding {
+             IDR.typeVariableBindingName = idrisName,
+             IDR.typeVariableBindingSignature = Nothing
+           }
 
-visitDeclaration
-    (HS.DataInsDecl location _ _ _ _) = do
-  return ()
 
-visitDeclaration
-    (HS.GDataInsDecl location _ _ _ _ _) = do
-  return ()
+visitKindSignature :: HS.Kind -> Conversion IDR.TypeSignature
+visitKindSignature HS.KindStar = do
+  return $ IDR.VariableTypeSignature $ IDR.Name "Type"
+visitKindSignature HS.KindBang = do
+  return $ IDR.VariableTypeSignature $ IDR.Name "Type"
+visitKindSignature (HS.KindFn lhs rhs) = do
+  idrisLHS <- visitKindSignature lhs
+  idrisRHS <- visitKindSignature rhs
+  return $ IDR.FunctionTypeSignature idrisLHS idrisRHS
+visitKindSignature (HS.KindParen kind) = do
+  idrisKind <- visitKindSignature kind
+  return $ IDR.ParenthesizedTypeSignature idrisKind
+visitKindSignature (HS.KindVar name) = do
+  idrisName <- visitName name
+  return $ IDR.VariableTypeSignature idrisName
 
-visitDeclaration
-    (HS.ClassDecl location _ name _ _ _) = do
-  emit "class "
-  emitName name
-  emit " where\n"
-  emit "\n"
 
-visitDeclaration
-    (HS.InstDecl location _ qname _ _) = do
-  return ()
-
-visitDeclaration
-    (HS.DerivDecl location _ qname _) = do
-  return ()
-
-visitDeclaration
-    (HS.InfixDecl location _ _ _) = do
-  return ()
-
-visitDeclaration
-    (HS.DefaultDecl location _) = do
-  return ()
-
-visitDeclaration
-    (HS.SpliceDecl location _) = do
-  return ()
-
-visitDeclaration
-    (HS.TypeSig location _ _) = do
-  return ()
-
-visitDeclaration
-    (HS.FunBind _) = do
-  return ()
-
-visitDeclaration
-    (HS.PatBind location _ _ _ _) = do
-  return ()
-
-visitDeclaration
-    (HS.ForImp location _ _ _ _ _) = do
-  return ()
-
-visitDeclaration
-    (HS.ForExp location _ _ _ _) = do
-  return ()
-
-visitDeclaration
-    (HS.RulePragmaDecl location _) = do
-  return ()
-
-visitDeclaration
-    (HS.DeprPragmaDecl location _) = do
-  return ()
-
-visitDeclaration
-    (HS.WarnPragmaDecl location _) = do
-  return ()
-
-visitDeclaration
-    (HS.InlineSig location _ _ qname) = do
-  return ()
-
-visitDeclaration
-    (HS.InlineConlikeSig location _ qname) = do
-  return ()
-
-visitDeclaration
-    (HS.SpecSig location qname _) = do
-  return ()
-
-visitDeclaration
-    (HS.SpecInlineSig location _ _ qname _) = do
-  return ()
-
-visitDeclaration
-    (HS.InstSig location _ qname _) = do
-  return ()
-
-visitDeclaration
-    (HS.AnnPragma location _) = do
-  return ()
+visitClassDeclaration :: HS.ClassDecl -> Conversion ()
+visitClassDeclaration (HS.ClsDecl declaration) = emit "hm\n"
+visitClassDeclaration _ = return ()
 
